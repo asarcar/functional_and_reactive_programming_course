@@ -9,7 +9,7 @@ import scala.concurrent.duration._
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.util.{ Try, Success, Failure }
 import rx.subscriptions.CompositeSubscription
-import rx.lang.scala.Observable
+import rx.lang.scala.{Observable, Notification}
 import observablex._
 import search._
 
@@ -37,10 +37,10 @@ trait WikipediaApi {
      *
      * E.g. `"erik", "erik meijer", "martin` should become `"erik", "erik_meijer", "martin"`
      */
-    def sanitized: Observable[String] = ???
-
+    def sanitized: Observable[String] =
+      obs.map(s => s.map(char => if (char == ' ') '_' else char))
   }
-
+  
   implicit class ObservableOps[T](obs: Observable[T]) {
 
     /** Given an observable that can possibly be completed with an error, returns a new observable
@@ -48,7 +48,19 @@ trait WikipediaApi {
      *
      * E.g. `1, 2, 3, !Exception!` should become `Success(1), Success(2), Success(3), Failure(Exception), !TerminateStream!`
      */
-    def recovered: Observable[Try[T]] = ???
+    def recovered: Observable[Try[T]] = Observable(
+      observer => {
+        obs.materialize.subscribe (
+          (notT: Notification[T]) => notT match {
+            case Notification.OnNext(t) => observer.onNext(Success(t))
+            case Notification.OnError(e) => observer.onNext(Failure(e))
+            case _ => // ignore: wierd - not matching Notification.OnCompleted
+          },
+          (e: Throwable) => throw e, // should not happen
+          () => observer.onCompleted()
+        )
+      }
+    )
 
     /** Emits the events from the `obs` observable, until `totalSec` seconds have elapsed.
      *
@@ -56,7 +68,10 @@ trait WikipediaApi {
      *
      * Note: uses the existing combinators on observables.
      */
-    def timedOut(totalSec: Long): Observable[T] = ???
+    def timedOut(totalSec: Long): Observable[T] = {
+      val exp = System.nanoTime() + (totalSec seconds).toNanos
+      obs.takeWhile(t => (System.nanoTime() <= exp))
+    }
 
 
     /** Given a stream of events `obs` and a method `requestMethod` to map a request `T` into
@@ -84,9 +99,22 @@ trait WikipediaApi {
      *
      * Observable(Success(1), Succeess(1), Succeess(1), Succeess(2), Succeess(2), Succeess(2), Succeess(3), Succeess(3), Succeess(3))
      */
-    def concatRecovered[S](requestMethod: T => Observable[S]): Observable[Try[S]] = ???
-
+    def concatRecovered[S](requestMethod: T => Observable[S]):
+        Observable[Try[S]] = {
+      /*
+       * WARNING: Todo: deal with the case where requestMethod may throw an exception
+       * i.e. define a function which maps Try[Observable[S]] to Observable[S]
+       */
+      obs.map(t => {
+        /*
+         * Unhealthy paranoia: what if requestMethod throws exception
+         */
+        Try(requestMethod(t)) match {
+          case Success(x) => x.recovered // x: Observable[S]
+          case Failure(ex) => Observable(Failure(ex)) // f: Failure(ex) 
+        }
+      }).concat
+    }
   }
-
 }
 

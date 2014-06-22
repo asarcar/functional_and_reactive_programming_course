@@ -27,10 +27,89 @@ object WikipediaSuggest extends SimpleSwingApplication with ConcreteSwingApi wit
     }
   }
 
+  /*
+   * wait time for HTTP requests fail
+   */ 
+  val maxWaitTimeHTTPGetInSecs: Long = 5
+
+  def searchAction(button: Button, searchTermField: TextField,
+    suggestionList: ListView[String], status: Label,
+    editorpane: EditorPane): Unit = {
+    val eventScheduler = SchedulerEx.SwingEventThreadScheduler
+
+    val searchTerms: Observable[String] = {
+      /*
+       * - textValues maps the text entered in the textField
+       *   (searchTermField) to Observable[String]
+       * - sanitized replaces as blank spaces with underscore as
+       *   search terms sent in an HTTP request cannot contain spaces
+       */
+      searchTermField.textValues.sanitized
+    }
+
+    val suggestions: Observable[Try[List[String]]] = {
+      /*
+       * - wait bounded time in case HTTP GET request fails
+       *   for suggestion Lists
+       * - wrap result in Try as we keep the throwable to
+       *   print the error message: use concatRecovered
+       */
+      searchTerms.concatRecovered(
+        term => wikiSuggestResponseStream(term).
+          timedOut(maxWaitTimeHTTPGetInSecs))
+    }
+
+    val suggestionSubscription: Subscription =
+      suggestions.observeOn(eventScheduler) subscribe {
+        (t: Try[List[String]]) => t match {
+          case Success(listString) => suggestionList.listData = listString
+          case Failure(ex) => status.text = ex.toString
+        }
+      }
+
+    /*
+     * - If the suggestion list had no items
+     *   selected, then the click should not be part of selections.
+     * - suggestionList.selection.items return a list of
+     *   selected items and not just one single item.
+     *   in this case we return only one item in list
+     */
+    val selections: Observable[String] = {
+      val obsButton: Observable[Button] = button.clicks
+      obsButton.filter(b => !suggestionList.selection.items.isEmpty).
+        map(b => suggestionList.selection.items.head)
+    }
+
+    /*
+     * - Using selections observable we obtain an observable
+     *   of the Wikipedia pages corresponding to the respective
+     *   search term. Requests may fail: wrap them into Try.
+     * - wait bounded time in case HTTP GET request fails
+     *   for the suggestion entry selected.
+     */
+    val pages: Observable[Try[String]] = {
+      selections.concatRecovered(
+        term => wikiPageResponseStream(term).
+          timedOut(maxWaitTimeHTTPGetInSecs))
+    }
+
+    /*
+     * - Render the observable pages: Subscribe to the
+     *   pages observable to update the editorpane with the
+     *   contents of the response.
+     */
+    val pageSubscription: Subscription =
+      pages.observeOn(eventScheduler) subscribe {
+        (tryPage: Try[String]) => tryPage match {
+          case Success(page) => editorpane.text = page
+          case Failure(ex) => editorpane.text =
+            s"HTTP Fetch page failed with exception ${ex.toString}"
+        }
+      }
+  }
+
   def top = new MainFrame {
-
     /* gui setup */
-
     title = "Query Wikipedia"
     minimumSize = new Dimension(900, 600)
 
@@ -69,44 +148,10 @@ object WikipediaSuggest extends SimpleSwingApplication with ConcreteSwingApi wit
       contents += status
     }
 
-    val eventScheduler = SchedulerEx.SwingEventThreadScheduler
-
-    /**
-     * Observables
-     * You may find the following methods useful when manipulating GUI elements:
-     *  `myListView.listData = aList` : sets the content of `myListView` to `aList`
-     *  `myTextField.text = "react"` : sets the content of `myTextField` to "react"
-     *  `myListView.selection.items` returns a list of selected items from `myListView`
-     *  `myEditorPane.text = "act"` : sets the content of `myEditorPane` to "act"
-     */
-
-    // TO IMPLEMENT
-    val searchTerms: Observable[String] = ???
-
-    // TO IMPLEMENT
-    val suggestions: Observable[Try[List[String]]] = ???
-
-
-    // TO IMPLEMENT
-    val suggestionSubscription: Subscription =  suggestions.observeOn(eventScheduler) subscribe {
-      x => ???
-    }
-
-    // TO IMPLEMENT
-    val selections: Observable[String] = ???
-
-    // TO IMPLEMENT
-    val pages: Observable[Try[String]] = ???
-
-    // TO IMPLEMENT
-    val pageSubscription: Subscription = pages.observeOn(eventScheduler) subscribe {
-      x => ???
-    }
-
+    searchAction(button, searchTermField, suggestionList,
+      status, editorpane)
   }
-
 }
-
 
 trait ConcreteWikipediaApi extends WikipediaApi {
   def wikipediaSuggestion(term: String) = Search.wikipediaSuggestion(term)

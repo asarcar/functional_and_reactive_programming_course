@@ -1,7 +1,5 @@
 package suggestions
 
-
-
 import language.postfixOps
 import scala.concurrent._
 import scala.concurrent.duration._

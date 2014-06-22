@@ -44,6 +44,8 @@ trait SwingApi {
     def unsubscribe(r: Reaction): Unit
   }
 
+  /* Import Subscription companion object */
+  import rx.lang.scala.subscriptions.Subscription 
   implicit class TextFieldOps(field: TextField) {
 
     /** Returns a stream of text field values entered in the given text field.
@@ -51,8 +53,22 @@ trait SwingApi {
       * @param field the text field
       * @return an observable with a stream of text field updates
       */
-    def textValues: Observable[String] = ???
-
+    def textValues: Observable[String] = Observable {
+      observer => {
+        val r: Reaction = event => event match {
+          case ValueChanged(tf) => observer.onNext(tf.text)
+          case _ => // ok
+            /*
+             * TextField also posts other events (e.g. LostFocus).
+             * It is better to ignore all other even posts.
+             * instead of posting error e.g.
+             * observer.onError(new Exception("TextField: Error"))
+             */
+        }
+        field.subscribe(r)
+        Subscription {field.unsubscribe(r)}
+      }
+    }
   }
 
   implicit class ButtonOps(button: Button) {
@@ -62,8 +78,21 @@ trait SwingApi {
      * @param field the button
      * @return an observable with a stream of buttons that have been clicked
      */
-    def clicks: Observable[Button] = ???
-
+    def clicks: Observable[Button] = Observable {
+      observer => {
+        val r: Reaction = event => event match {
+          case ButtonClicked(button) => observer.onNext(button)
+          case _ => // ok
+            /*
+             * Button also posts other events (e.g. LostFocus).
+             * It is better to ignore all other even posts.
+             * instead of posting error e.g.
+             * observer.onError(new Exception("Button: Error"))
+             */
+        }
+        button.subscribe(r)
+        Subscription {button.unsubscribe(r)}
+      }
+    }
   }
-
 }
