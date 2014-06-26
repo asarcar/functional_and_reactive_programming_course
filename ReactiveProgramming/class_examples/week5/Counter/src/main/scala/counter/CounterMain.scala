@@ -97,7 +97,7 @@ object CounterMain extends App {
 
   // running inside a TestKit
   println("Testing Counter Inside TestKit...")
-  new TestKit(ActorSystem("TestSys")) with ImplicitSender {
+  new TestKit(ActorSystem("CounterDriver3")) with ImplicitSender {
     val cd3 = system.actorOf(Props[CounterDriver])
     cd3 ! CounterDriver.AddNum(2)
     expectNoMsg(100 millis)
