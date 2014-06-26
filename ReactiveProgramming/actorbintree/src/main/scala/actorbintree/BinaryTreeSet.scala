@@ -4,7 +4,12 @@
 package actorbintree
 
 import akka.actor._
+import akka.actor.PoisonPill
 import scala.collection.immutable.Queue
+import scala.concurrent.duration._
+import scala.concurrent.ExecutionContext.Implicits.global
+import scala.language.postfixOps
+import scala.util.Random
 
 object BinaryTreeSet {
 
@@ -90,6 +95,14 @@ class BinaryTreeSet extends Actor with ActorLogging {
       log.debug("CopyFinished: self {} child {}", self.toString, sender.toString)
       pendingQueue foreach (newRoot ! _)
       pendingQueue = Queue()
+      /*
+       * Stop all the actors under the root hierarchy.
+       * Trying to recursively (up from leaves to root) programmatically
+       * was leading to "dead letters encountered" messages.
+       * The stop message on an actor ensures that a clean orderly
+       * process is followed where the entire hierarchy is cleaned up.
+       */
+      context.stop(root)
       root = newRoot
       context.become(normal)
     }
@@ -178,7 +191,20 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean)
     if ((children.size == 0) && insertConfirmed) {
       log.debug("Actor Stopping: insert confirmed & all children confirmed copy")
       context.parent ! CopyFinished
-      context.stop(self)
+      /*
+       * When children die at the same time when parents (supervisor) dies
+       * one often gets dead letters encountered. Tried to ensure
+       * parents and children do not die at the same time by adding
+       * randomness and sending PoisonPill. Still caused issues.
+       *
+       * context.system.scheduler.
+       *   scheduleOnce(100 + new Random().nextInt(400) millis){
+       *     self ! PoisonPill
+       * } // context.stop(self) 
+       *       
+       * Thus moving to the standard context.stop call at the root
+       * that will stop the entire hierarch beneath...
+       */
     }
   }
 

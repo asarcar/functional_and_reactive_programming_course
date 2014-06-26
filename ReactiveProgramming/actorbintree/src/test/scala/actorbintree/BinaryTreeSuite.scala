@@ -19,15 +19,14 @@ import org.scalatest.junit.JUnitRunner
 @RunWith(classOf[JUnitRunner])
 class BinaryTreeSuite(_system: ActorSystem) extends TestKit(_system)
     with FunSuite with ShouldMatchers with BeforeAndAfterAll
-    with ImplicitSender
-{
+    with ImplicitSender {
   /*
    * Alternate constructor delegates to primary constructor.
    * BinaryTreeSuite() will default to BinaryTreeSuite(ActorSystem("PostponeSpec")
    */
   def this() = this(ActorSystem("PostponeSpec"))
 
-  override def afterAll: Unit = system.shutdown()
+  override def afterAll: Unit = {Thread.sleep(1000); system.shutdown()}
 
   import actorbintree.BinaryTreeSet._
 
@@ -113,7 +112,8 @@ class BinaryTreeSuite(_system: ActorSystem) extends TestKit(_system)
   }
 
   test("GC, Insert, Query") {
-    val topNode = system.actorOf(Props[BinaryTreeSet])
+    val topNode = system.actorOf(Props[BinaryTreeSet],
+      "GC_Insert_Query")
 
     topNode ! GC
 
@@ -125,7 +125,8 @@ class BinaryTreeSuite(_system: ActorSystem) extends TestKit(_system)
   }
 
   test("Insert, Remove, GC, Query") {
-    val topNode = system.actorOf(Props[BinaryTreeSet])
+    val topNode = system.actorOf(Props[BinaryTreeSet],
+      "Insert_Remove_GC_Query")
 
     topNode ! Insert(testActor, id = 1, 1)
     expectMsg(OperationFinished(id = 1))

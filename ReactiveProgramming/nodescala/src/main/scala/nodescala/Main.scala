@@ -1,10 +1,9 @@
 package nodescala
 
-import scala.language.postfixOps
-import scala.concurrent._
-import scala.concurrent.duration._
-import ExecutionContext.Implicits.global
 import scala.async.Async.{async, await}
+import scala.concurrent.duration._
+import scala.concurrent.ExecutionContext.Implicits.global
+import scala.language.postfixOps
 
 object Main {
 

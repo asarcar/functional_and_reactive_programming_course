@@ -3,12 +3,17 @@ package counter
 import akka.actor.Actor
 import akka.actor.ActorLogging
 import akka.actor.ActorSystem
+import akka.actor.PoisonPill
 import akka.actor.Props
 import akka.actor.ReceiveTimeout
 import akka.testkit.ImplicitSender
 import akka.testkit.TestKit
 import akka.testkit.TestProbe
+
+import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration._
+
+import scala.util.Random
 
 object CounterDriver {
   case class AddNum(n: Int)
@@ -21,32 +26,33 @@ object CounterDriver {
 class CounterDriver extends Actor with ActorLogging {
   import CounterDriver._
   val counter = context.actorOf(Props[Counter], "counter")
+  val rnd = new Random()
 
   // Just testing one msg
   self ! Counter.Get(self)
 
   def receive = {
     case AddNum(n) => {
-      log.info("AddNum({}) Request...", n)
+      log.debug("AddNum({}) Request...", n)
       for (i <- 0 until n)
         counter ! Counter.Incr
     }
     case ValRequest => {
-      log.info("ValRequest...")
+      log.debug("ValRequest...")
       counter ! Counter.Get(sender)
     }
     case Counter.CurVal(x, client) => {
-      log.info("CurVal: count = {}...", x)
+      log.debug("CurVal: count = {}...", x)
       client ! ValReply(x)
     }
     case DownRequest => {
-      log.info("DownRequest...")
+      log.debug("DownRequest...")
       counter ! Counter.Down(sender)
       context.become(completeDown)
     }
       /*
        * case ReceiveTimeout => {
-       *   log.info("All work completed & terminated")
+       *   log.debug("All work completed & terminated")
        * }
        * case Counter.DoneAck => {
        *   context.setReceiveTimeout(1 seconds)
@@ -55,15 +61,18 @@ class CounterDriver extends Actor with ActorLogging {
   }
   def completeDown: Receive = {
     case Counter.CurVal(x, client) => {
-      log.info("CurVal: count = {}...", x)
+      log.debug("CurVal: count = {}...", x)
       client ! ValReply(x)
     }
     case Counter.DownAck(client) => {
-      log.info("All work completed & terminated")
+      log.debug("All work completed & terminated")
       client ! DownReply
-      context.stop(self)
+      goDown // context.stop(self)
     }
   }
+
+  def goDown = context.system.scheduler.
+    scheduleOnce(100 + rnd.nextInt(900) millis){self ! PoisonPill}
 }
 
 object CounterMain extends App {
@@ -72,15 +81,15 @@ object CounterMain extends App {
 
   println("Testing Counter Directly...")
   val sys = ActorSystem("CounterDriver")
-  val cd = sys.actorOf(Props[CounterDriver])
-  Thread.sleep(2000)
+  val cd = sys.actorOf(Props[CounterDriver], "CounterDriverMain")
+  
   sys.shutdown()
   println("Testing Counter Directly Done...")
 
   println("Testing Counter Via Probe...")
   // running a TestProbe from the outside
   implicit val system2 = ActorSystem("CounterDriver2")
-  val cd2 = system2.actorOf(Props[CounterDriver])
+  val cd2 = system2.actorOf(Props[CounterDriver], "CounterDriver2Main")
   val p = TestProbe()
   p.send(cd2, CounterDriver.AddNum(3))
   p.expectNoMsg(100 millis)
@@ -98,7 +107,7 @@ object CounterMain extends App {
   // running inside a TestKit
   println("Testing Counter Inside TestKit...")
   new TestKit(ActorSystem("CounterDriver3")) with ImplicitSender {
-    val cd3 = system.actorOf(Props[CounterDriver])
+    val cd3 = system.actorOf(Props[CounterDriver], "CounterDriver3Main")
     cd3 ! CounterDriver.AddNum(2)
     expectNoMsg(100 millis)
     cd3 ! CounterDriver.ValRequest
