@@ -10,6 +10,18 @@ import kvstore.Arbiter.{ JoinedSecondary, Join }
 import kvstore.Persistence.{ Persisted, Persist }
 import kvstore.Replicator.{ SnapshotAck, Snapshot, Replicate }
 
+/**
+  * Implement the replicator so that it correctly mediates between
+  * replication requests, snapshots and acknowledgements.
+  * Resending snapshots from the Replicator without pause is not the
+  * intended solution the resend rate needs to be kept
+  * reasonable. This fact is exploited implicitly by the test suite
+  * in step 3.
+  * TODO: Write tests to incorporate unreliable communication between
+  * primary and secondary replicas. Have the Arbiter wrap the secondary
+  * nodes ActorRefs in small actors which normally forward messages
+  * but sometimes forget to do so.
+  */
 class Step3_ReplicatorSpec extends TestKit(ActorSystem("Step3ReplicatorSpec"))
   with FunSuite
   with BeforeAndAfterAll

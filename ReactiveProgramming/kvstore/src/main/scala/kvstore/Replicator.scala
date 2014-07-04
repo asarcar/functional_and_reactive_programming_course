@@ -1,5 +1,6 @@
 package kvstore
 
+import akka.actor._
 import akka.actor.Props
 import akka.actor.Actor
 import akka.actor.ActorRef
@@ -9,24 +10,70 @@ object Replicator {
   case class Replicate(key: String, valueOption: Option[String], id: Long)
   case class Replicated(key: String, id: Long)
   
+  /**
+    * The Snapshot message provides a sequence number (seq)
+    * to enforce ordering between the updates. Updates for
+    * a given secondary replica must be processed in contiguous
+    * ascending sequence number order; this ensures that updates
+    * for every single key are applied in the correct order.
+    * Each Replicator uses its own number sequence starting at zero.
+    *
+    * When a snapshot arrives at a Replica with a sequence number
+    * which is greater than the currently expected number, then that
+    * snapshot must be ignored (meaning no state change and no reaction).
+    * 
+    * when a snapshot arrives at a Replica with a sequence number which
+    * is smallernumber, then that snapshot must be ignored and immediately
+    * acknowledged.
+    */
   case class Snapshot(key: String, valueOption: Option[String], seq: Long)
+  /**
+    * SnapshotAck(key, seq) is the reply sent by the secondary replica
+    * to the Replicator as soon as the update is persisted locally by
+    * the secondary replica. The replica might never send this reply
+    * in case it is unable to persist the update.
+    * 
+    * The acknowledgement is sent immediately for requests whose sequence
+    * number is less than the next expected number.
+    *
+    * The expected number is set to the greater of the previously
+    * expected number the sequence number just acknowledged + 1
+    */
   case class SnapshotAck(key: String, seq: Long)
 
   def props(replica: ActorRef): Props = Props(new Replicator(replica))
 }
 
-class Replicator(val replica: ActorRef) extends Actor {
+class Replicator(val replica: ActorRef) extends Actor with ActorLogging {
   import Replicator._
   import Replica._
   import context.dispatcher
   
-  /*
-   * The contents of this actor is just a suggestion, you can implement it in any way you like.
-   */
+  /**
+    * The contents of this actor is just a suggestion, you can implement
+    * it in any way you like.
+    */
 
-  // map from sequence number to pair of sender and request
+  /**
+    * map from sequence number to pair of sender and request
+    */
   var acks = Map.empty[Long, (ActorRef, Replicate)]
-  // a sequence of not-yet-sent snapshots (you can disregard this if not implementing batching)
+  /**
+    * a sequence of not-yet-sent snapshots (you can disregard this
+    * if not implementing batching)
+    *
+    * Since the replication protocol is meant to symbolize remote
+    * replication you must consider the case that either a Snapshot
+    * message or its corresponding SnapshotAck message is lost on
+    * the way. Therefore the Replicator must make sure to
+    * periodically retransmit all unacknowledged changes. For
+    * grading purposes it is assumed that this happens roughly
+    * every 100 milliseconds. To allow for batching (see above)
+    * we will assume that a lost Snapshot message will lead to a
+    * resend at most 200 milliseconds after the Replicate request
+    * was received (again, the ActorSystems scheduler service is
+    * considered precise enough for this purpose).
+    */
   var pending = Vector.empty[Snapshot]
   
   var _seqCounter = 0L
@@ -36,7 +83,9 @@ class Replicator(val replica: ActorRef) extends Actor {
     ret
   }
   
-  /* TODO Behavior for the Replicator. */
+  /**
+    * TODO Behavior for the Replicator.
+    */
   def receive: Receive = {
     case _ =>
   }

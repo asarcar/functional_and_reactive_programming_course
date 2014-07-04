@@ -11,6 +11,11 @@ import kvstore.Persistence.{ Persisted, Persist }
 import scala.util.Random
 import scala.util.control.NonFatal
 
+/**
+  * Implement the secondary replica role so that it correctly
+  * responds to the read-only part of the KV protocol and
+  * accepts the replication protocol, without considering persistence.
+  */
 class Step2_SecondarySpec extends TestKit(ActorSystem("Step2SecondarySpec"))
   with FunSuite
   with BeforeAndAfterAll

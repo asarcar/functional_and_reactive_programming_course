@@ -25,6 +25,7 @@ class Counter extends Actor with ActorLogging {
   import Counter._
   var count = 0
   val rnd = new Random()
+
   def receive = {
     case Incr => {
       count += 1
@@ -37,7 +38,8 @@ class Counter extends Actor with ActorLogging {
     case Down(client: ActorRef) => {
       log.debug("Terminating...")
       sender ! DownAck(client)
-      goDown // context.stop(self)
+      // goDown
+      context.stop(self)
     }
   }
 

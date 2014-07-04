@@ -10,6 +10,12 @@ import akka.testkit.TestProbe
 import Arbiter._
 import Replicator._
 
+/**
+  * Implement the sending of the initial state replication to newly joined replicas.
+  * The logic for collecting acknowledgements of persistence and
+  * replication can be made such that it is usable both in primary
+  * and secondary replicas.
+  */
 class Step6_NewSecondarySpec extends TestKit(ActorSystem("Step6NewSecondarySpec"))
   with FunSuite
   with BeforeAndAfterAll

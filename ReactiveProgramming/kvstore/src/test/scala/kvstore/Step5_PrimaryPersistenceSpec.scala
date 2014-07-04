@@ -12,6 +12,9 @@ import Arbiter._
 import Persistence._
 import Replicator._
 
+/**
+  * Implement the use of persistence and replication at the primary replica.
+  */
 class Step5_PrimaryPersistenceSpec extends TestKit(ActorSystem("Step5PrimaryPersistenceSpec"))
   with FunSuite
   with BeforeAndAfterAll
