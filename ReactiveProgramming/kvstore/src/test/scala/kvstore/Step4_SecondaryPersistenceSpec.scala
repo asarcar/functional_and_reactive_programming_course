@@ -37,7 +37,8 @@ class Step4_SecondaryPersistenceSpec extends TestKit(ActorSystem("Step4Secondary
     val arbiter = TestProbe()
     val persistence = TestProbe()
     val replicator = TestProbe()
-    val secondary = system.actorOf(Replica.props(arbiter.ref, probeProps(persistence)), "case1-secondary")
+    val secondary = system.actorOf(Replica.props(arbiter.ref, probeProps(persistence)),
+      "case1-secondary")
     val client = session(secondary)
 
     arbiter.expectMsg(Join)
@@ -56,9 +57,9 @@ class Step4_SecondaryPersistenceSpec extends TestKit(ActorSystem("Step4Secondary
     replicator.expectNoMsg(500.milliseconds)
 
     persistence.reply(Persisted("k1", persistId))
-    replicator.expectMsg(SnapshotAck("k1", 0L))
+    replicator.expectMsg(SnapshotAck("k1", persistId))
   }
-  /*
+
   test("case2: Secondary should retry persistence in every 100 milliseconds") {
     import Replicator._
 
@@ -89,5 +90,4 @@ class Step4_SecondaryPersistenceSpec extends TestKit(ActorSystem("Step4Secondary
     persistence.reply(Persisted("k1", persistId))
     replicator.expectMsg(SnapshotAck("k1", 0L))
   }
-   */
 }

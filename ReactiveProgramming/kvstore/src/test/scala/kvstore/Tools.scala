@@ -13,7 +13,12 @@ import scala.concurrent.duration._
 
 object Tools {
   class TestRefWrappingActor(val probe: TestProbe) extends Actor {
-    def receive = { case msg => probe.ref forward msg }
+    def receive = {
+      // case msg => probe.ref forward msg
+      case msg if (sender == context.parent) => probe.ref ! msg
+      case msg if (sender == probe.ref) => context.parent ! msg
+      case x => assert(false, s"$x msg unexpected")
+    }
   }
 }
 

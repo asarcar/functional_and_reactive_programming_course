@@ -5,6 +5,7 @@ import akka.actor.Props
 import akka.actor.Actor
 import akka.actor.ActorRef
 import scala.concurrent.duration._
+import scala.language.postfixOps
 
 object Replicator {
   case class Replicate(key: String, valueOption: Option[String], id: Long)
@@ -41,6 +42,11 @@ object Replicator {
     */
   case class SnapshotAck(key: String, seq: Long)
 
+  /**
+    * TimerTick used for transmitting all unacknowledged Snapshots
+    */
+  case object TimerTick
+
   def props(replica: ActorRef): Props = Props(new Replicator(replica))
 }
 
@@ -55,7 +61,8 @@ class Replicator(val replica: ActorRef) extends Actor with ActorLogging {
     */
 
   /**
-    * map from sequence number to pair of sender and request
+    * map from sequence number to pair of sender and
+    * sorted array of requests. 
     */
   var acks = Map.empty[Long, (ActorRef, Replicate)]
   /**
@@ -75,19 +82,76 @@ class Replicator(val replica: ActorRef) extends Actor with ActorLogging {
     * considered precise enough for this purpose).
     */
   var pending = Vector.empty[Snapshot]
-  
+
   var _seqCounter = 0L
   def nextSeq = {
     val ret = _seqCounter
     _seqCounter += 1
     ret
   }
-  
+
+  /**
+    * Timer tick to retransmit all unacknowledged SnapShots every 100ms
+    */
+  val tickDur: FiniteDuration = 100 milliseconds
+  val sendTo = self
+  context.system.scheduler.schedule(0 millisecond, tickDur){
+    sendTo ! TimerTick
+  }(context.system.dispatcher)
+
+  /**
+    * Add Snapshot entries a Vector of txEntries
+    * (sorted by sequence is ensures reasonable
+    * performance from protocol (while sending to replicas)
+    */
+  def createTxEntries: Vector[Snapshot] = {
+    var txArray = scala.collection.mutable.ArrayBuffer.empty[Snapshot]
+    acks foreach {
+      entry => {
+        val (seq, (client, rep)) = entry
+          rep match {
+            case Replicate(key, valueOption, id) => {
+              txArray += Snapshot(key, valueOption, seq)
+            }
+            case x => assert(false, s"$x unexpected")
+          }
+      }
+    }
+    txArray.sortWith((e1, e2) => (e1.seq < e2.seq)).toVector
+  }
+
+  def txEntries(txVector: Vector[Snapshot]) =
+    txVector foreach (replica ! _)
+
+  def procReplReq(rep: Replicate) = {
+    val seq = nextSeq // generate the next sequence
+    assert(!acks.isDefinedAt(seq))
+    acks += seq -> (sender, rep)
+  }
+
+  def procSnapAck(snapAck: SnapshotAck) = {
+    /**
+      * 1. Look up the sequence in the Map
+      * 2. Acknowledge to sender for the corresponding entry
+      */
+    val seq = snapAck.seq
+    assert(acks.isDefinedAt(seq),
+      s"$snapAck does not exists in acks map")
+    val (client, rep) = acks.apply(seq)
+    acks -= seq // remove this entry from unacknowledged entries
+    rep match {
+      case Replicate(key, valueOption, id) => client ! Replicated(key, id)
+      case x => assert(false, s"$x unexpected")
+    }
+  }
+
   /**
     * TODO Behavior for the Replicator.
     */
   def receive: Receive = {
-    case _ =>
+    case snapAck: SnapshotAck => procSnapAck(snapAck)
+    case rep: Replicate => procReplReq(rep)
+    case TimerTick => txEntries(createTxEntries)
+    case x => assert(false, s"$x unexpected")
   }
-
 }

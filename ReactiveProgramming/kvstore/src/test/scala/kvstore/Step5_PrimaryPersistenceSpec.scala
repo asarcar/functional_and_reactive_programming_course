@@ -29,7 +29,8 @@ class Step5_PrimaryPersistenceSpec extends TestKit(ActorSystem("Step5PrimaryPers
   test("case1: Primary does not acknowledge updates which have not been persisted") {
     val arbiter = TestProbe()
     val persistence = TestProbe()
-    val primary = system.actorOf(Replica.props(arbiter.ref, probeProps(persistence)), "case1-primary")
+    val primary = system.actorOf(Replica.props(arbiter.ref,
+      probeProps(persistence)), "case1-primary")
     val client = session(primary)
 
     arbiter.expectMsg(Join)
@@ -48,7 +49,8 @@ class Step5_PrimaryPersistenceSpec extends TestKit(ActorSystem("Step5PrimaryPers
   test("case2: Primary retries persistence every 100 milliseconds") {
     val arbiter = TestProbe()
     val persistence = TestProbe()
-    val primary = system.actorOf(Replica.props(arbiter.ref, probeProps(persistence)), "case2-primary")
+    val primary = system.actorOf(Replica.props(arbiter.ref,
+      probeProps(persistence)), "case2-primary")
     val client = session(primary)
 
     arbiter.expectMsg(Join)
@@ -59,8 +61,10 @@ class Step5_PrimaryPersistenceSpec extends TestKit(ActorSystem("Step5PrimaryPers
       case Persist("foo", Some("bar"), id) => id
     }
     // Retries form above
-    persistence.expectMsg(200.milliseconds, Persist("foo", Some("bar"), persistId))
-    persistence.expectMsg(200.milliseconds, Persist("foo", Some("bar"), persistId))
+    persistence.expectMsg(200.milliseconds,
+      Persist("foo", Some("bar"), persistId))
+    persistence.expectMsg(200.milliseconds,
+      Persist("foo", Some("bar"), persistId))
 
     client.nothingHappens(100.milliseconds)
     persistence.reply(Persisted("foo", persistId))
@@ -70,7 +74,8 @@ class Step5_PrimaryPersistenceSpec extends TestKit(ActorSystem("Step5PrimaryPers
   test("case3: Primary generates failure after 1 second if persistence fails") {
     val arbiter = TestProbe()
     val persistence = TestProbe()
-    val primary = system.actorOf(Replica.props(arbiter.ref, probeProps(persistence)), "case3-primary")
+    val primary = system.actorOf(Replica.props(arbiter.ref,
+      probeProps(persistence)), "case3-primary")
     val client = session(primary)
 
     arbiter.expectMsg(Join)
@@ -113,11 +118,11 @@ class Step5_PrimaryPersistenceSpec extends TestKit(ActorSystem("Step5PrimaryPers
     val setId = client.set("foo", "bar")
     val seqA = secondaryA.expectMsgType[Snapshot].seq
     val seqB = secondaryB.expectMsgType[Snapshot].seq
+
     client.nothingHappens(300.milliseconds)
     secondaryA.reply(SnapshotAck("foo", seqA))
     client.nothingHappens(300.milliseconds)
     secondaryB.reply(SnapshotAck("foo", seqB))
     client.waitAck(setId)
   }
-
 }

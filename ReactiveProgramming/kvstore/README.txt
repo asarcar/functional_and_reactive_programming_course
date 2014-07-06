@@ -248,3 +248,12 @@ Assuming that the primary does not fail for a sufficiently long time period afte
 Clients are expected not to reuse request IDs
 
 This restriction makes your solution simpler and it also removes the need for some grading tests which would have been hard to formulate in a way which does not assume too much about your solution. In a real system you might even find this restriction as specified operational requirement.
+---
+Test Each Case Separately:  
+test-only kvstore.Step1_PrimarySpec
+test-only kvstore.Step2_SecondarySpec
+test-only kvstore.Step3_ReplicatorSpec
+test-only kvstore.Step4_SecondaryPersistenceSpec
+test-only kvstore.Step5_PrimaryPersistenceSpec
+test-only kvstore.Step6_NewSecondarySpec
+
