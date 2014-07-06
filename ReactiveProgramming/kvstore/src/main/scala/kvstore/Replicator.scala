@@ -95,9 +95,13 @@ class Replicator(val replica: ActorRef) extends Actor with ActorLogging {
     */
   val tickDur: FiniteDuration = 100 milliseconds
   val sendTo = self
-  context.system.scheduler.schedule(0 millisecond, tickDur){
-    sendTo ! TimerTick
-  }(context.system.dispatcher)
+
+  var cancelReplicatorTimer: Cancellable =
+    context.system.scheduler.schedule(0 millisecond, tickDur){
+      sendTo ! TimerTick
+    }(context.system.dispatcher)
+
+  override def postStop(): Unit = cancelReplicatorTimer.cancel()
 
   /**
     * Add Snapshot entries a Vector of txEntries
@@ -105,18 +109,10 @@ class Replicator(val replica: ActorRef) extends Actor with ActorLogging {
     * performance from protocol (while sending to replicas)
     */
   def createTxEntries: Vector[Snapshot] = {
-    var txArray = scala.collection.mutable.ArrayBuffer.empty[Snapshot]
-    acks foreach {
-      entry => {
-        val (seq, (client, rep)) = entry
-          rep match {
-            case Replicate(key, valueOption, id) => {
-              txArray += Snapshot(key, valueOption, seq)
-            }
-            case x => assert(false, s"$x unexpected")
-          }
-      }
-    }
+    var txArray: scala.collection.mutable.ArrayBuffer[Snapshot] =
+      scala.collection.mutable.ArrayBuffer.empty
+    for ((seq, (client, Replicate(key, valueOption, id))) <- acks)
+      txArray += Snapshot(key, valueOption, seq)
     txArray.sortWith((e1, e2) => (e1.seq < e2.seq)).toVector
   }
 
@@ -125,23 +121,24 @@ class Replicator(val replica: ActorRef) extends Actor with ActorLogging {
 
   def procReplReq(rep: Replicate) = {
     val seq = nextSeq // generate the next sequence
-    assert(!acks.isDefinedAt(seq))
+    assert(!acks.isDefinedAt(seq),
+      s"$seq exists in acks map")      
     acks += seq -> (sender, rep)
   }
 
   def procSnapAck(snapAck: SnapshotAck) = {
     /**
-      * 1. Look up the sequence in the Map
-      * 2. Acknowledge to sender for the corresponding entry
+      * 1. Look up the sequence in the Map.
+      * 2. If the sequence does not exist, the Snapshot acknowledgement
+      *    has already been processed. This must be a retx. We are done.
+      * 2. Otherwise, acknowledge to sender for the corresponding entry
       */
     val seq = snapAck.seq
-    assert(acks.isDefinedAt(seq),
-      s"$snapAck does not exists in acks map")
-    val (client, rep) = acks.apply(seq)
-    acks -= seq // remove this entry from unacknowledged entries
-    rep match {
-      case Replicate(key, valueOption, id) => client ! Replicated(key, id)
-      case x => assert(false, s"$x unexpected")
+    log.debug("SnapAck {} received", snapAck)
+    if (acks.isDefinedAt(seq)) {
+      val (client, repMsg) = acks.apply(seq)
+      acks -= seq // remove this entry from unacknowledged entries
+      client ! Replicated(repMsg.key, repMsg.id)
     }
   }
 

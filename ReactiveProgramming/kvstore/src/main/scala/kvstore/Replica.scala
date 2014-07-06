@@ -56,8 +56,9 @@ object Replica {
   case class GetResult(key: String, valueOption: Option[String], id: Long) extends OperationReply
 
   sealed trait TimeOut
-  case class XactTimeOut(id: Long, client: ActorRef) extends TimeOut
-  case class PersistRetryTimeOut(id: Long, persistMsg: Persist) extends TimeOut
+  case class ReplicationTimeOut(id: Long, client: ActorRef) extends TimeOut
+  case class PersistTimeOut(seq: Long, client: ActorRef) extends TimeOut
+  case class PersistRetryTimeOut(seq: Long, persistMsg: Persist) extends TimeOut
 
   def props(arbiter: ActorRef, persistenceProps: Props): Props = Props(new Replica(arbiter, persistenceProps))
 }
@@ -78,11 +79,31 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props)
   /**
     * a map from secondary replicas to replicators
     */
-  var secondaries = Map.empty[ActorRef, ActorRef]
+  var secondaries: Map[ActorRef, ActorRef] = Map.empty
   /**
     * the current set of replicators
     */
-  var replicators = Set.empty[ActorRef]
+  var replicators: Set[ActorRef] = Set.empty
+
+  var persistor: ActorRef = context.actorOf(persistenceProps, "Persistor")
+  context.watch(persistor)
+
+  /**
+    * Next expected sequence number for this replica from replicator
+    * TODO: take care of restarts
+    */
+  var _nextSeqExpected = 0L
+  def getNextSeqExpected = {val r = _nextSeqExpected; r}
+  def incrNextSeqExpected = {_nextSeqExpected += 1}
+
+  val timeOutDur: FiniteDuration = 1000 milliseconds
+  val retryTimeOut: FiniteDuration = 100 milliseconds
+
+  /**
+    * A monotonically increasing identifier for any new replicas
+    */
+  var _replicaNum = 0
+  def getNextReplicaNum = {val rN = _replicaNum; _replicaNum +=1 ; rN}
 
   /**
     * 1. Register with arbiter
@@ -98,28 +119,14 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props)
     }
   // Erlang uses: stoppingStrategy
 
-  var persistor: ActorRef = context.actorOf(persistenceProps, "Persistor")
-  context.watch(persistor)
-
-  /**
-    * Next expected sequence number for this replica from replicator
-    * TODO: take care of restarts
-    */
-  var _nextSeqExpected = 0L
-  def getNextSeqExpected = {val r = _nextSeqExpected; r}
-  def incrNextSeqExpected = {_nextSeqExpected += 1}
-
-  val numRetries = 10
-  val timeOutDur: FiniteDuration = 1000 milliseconds
-  val retryTimeOut: FiniteDuration = 100 milliseconds
-  /**
-    * 1. Get role and set replicators
-    * 2. Start Persistence Actor
-    * 3. For each replicator start
-    */
   def receive = {
     case JoinedPrimary   => {
       context.become(leader)
+      /**
+        * Kick start the KV store by self configuring
+        * the leader as a replica member
+        */
+      procReplicas(Replicas(Set(self)))
     }
     case JoinedSecondary => {
       context.become(replica)
@@ -128,217 +135,338 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props)
   }
 
   /**
-    * Map from query id to pending acks from
-    * 1. Persistor: 
-    * 2. Replicators: 
-    */
-  type XactId = Long
-  /**
-    * Client, Set of Actors where ack is pending
+    * Map from query id to
+    * 1. client actor reference AND
+    * 2. reference of all Replicators from whom ack is pending
     */
   type AckEntry = (ActorRef, Set[ActorRef]) 
-  var pendingAcks = Map.empty[XactId, AckEntry]
+  var pendingReplicationAcks = Map.empty[Long, AckEntry]
+  /**
+    * Map from sequence to
+    * client replication that initiated persistence request
+    */
+  var pendingPersistenceAck = Map.empty[Long, ActorRef]
 
-  def startPersistXaction(id: Long, persistMsg: Persist): Unit = {
+  /**
+    * Map of various timers so that outstanding ones may be cancelled
+    * 1. ReplicationTimers: id -> cancellable
+    * 2. PersistRetryTimers: seq -> cancellable
+    * 3. PersistTimer: seq -> cancellable
+    */
+  var cancelReplicationTimers: Map[Long, Cancellable] = Map.empty 
+  var cancelPersistTimers: Map[Long, Cancellable] = Map.empty
+  var cancelPersistRetryTimers: Map[Long, Cancellable] = Map.empty
+
+  override def postStop(): Unit = {
+    for ((seq, can) <- cancelReplicationTimers)
+      can.cancel()
+    for ((seq, can) <- cancelPersistTimers)
+      can.cancel()
+    for ((seq, can) <- cancelPersistRetryTimers)
+      can.cancel()
+  }
+
+  def startReplicationTimer(id: Long): Unit = {
     /**
-      * 1. Schedule timeout of this transaction.
-      * 2. Schedule retry of persistence
-      * 3. Send the Persist and Replicator messages
+      * Schedule timeout of this transaction.
       */
     val sendTo = self
     val client = sender
-    context.system.scheduler.scheduleOnce(timeOutDur) {
-      sendTo ! XactTimeOut(id, client)
+    cancelReplicationTimers +=
+    id -> context.system.scheduler.scheduleOnce(timeOutDur) {
+      sendTo ! ReplicationTimeOut(id, client)
     } (context.system.dispatcher)
-    context.system.scheduler.scheduleOnce(retryTimeOut) {
-      sendTo ! PersistRetryTimeOut(id, persistMsg)
+  }
+
+  def startPersistenceTimers(seq: Long, persistMsg: Persist): Unit = {
+    /**
+      * Schedule eventual timeout of persist xaction
+      * Schedule retry of persistence and send persist message
+      */
+    val sendTo = self
+    val client = sender
+    cancelPersistTimers +=
+    seq -> context.system.scheduler.scheduleOnce(timeOutDur) {
+      sendTo ! PersistTimeOut(seq, client)
+    } (context.system.dispatcher)
+    cancelPersistRetryTimers +=
+    seq -> context.system.scheduler.scheduleOnce(retryTimeOut) {
+      sendTo ! PersistRetryTimeOut(seq, persistMsg)
     } (context.system.dispatcher)
 
     persistor ! persistMsg
   }
 
-  def startOperXaction(opCmd: Operation): Unit = {
-    val (id, persistMsg, repMsg): (XactId, Persist, Replicate) =
-      opCmd match {
-        case Insert(key, value, id) =>
-          (id, Persist(key, Some(value), id),
-            Replicate(key, Some(value), id))
-        case Remove(key, id) =>
-          (id, Persist(key, None, id),
-            Replicate(key, None, id))
-        case x => (-1, null, null)
-      }
-    val entry: AckEntry = (sender, replicators + persistor)
-    pendingAcks += id -> entry
-    startPersistXaction(id, persistMsg)
-    replicators foreach(_ ! repMsg)
+  def prepareForReplication(rMsg: Replicate,
+    reps: Set[ActorRef]) = {
+    pendingReplicationAcks += rMsg.id -> (sender, reps)
+    startReplicationTimer(rMsg.id)
+    reps foreach(_ ! rMsg)
   }
 
-  def startSnapXaction(snapCmd: Snapshot): Unit = {
-    val (seq, persistMsg): (XactId, Persist) =
-      snapCmd match {
-        case Snapshot(key, valueOption, seq) =>
-          (seq, Persist(key, valueOption, seq))
-        case x => (-1, null)
-      }
-    val entry: AckEntry = (sender, Set(persistor))
-    pendingAcks += seq -> entry
-    startPersistXaction(seq, persistMsg)
+  def startInsertReplication(insMsg: Insert, reps: Set[ActorRef]) = {
+    log.debug("Create {} with acks needed from {}", insMsg, reps)
+    prepareForReplication(
+      Replicate(insMsg.key, Some(insMsg.value), insMsg.id), reps)
   }
 
-  def procAck(key: String, idOrSeq: XactId, operXaction: Boolean) = {
-    val entry = pendingAcks.get(idOrSeq)
-    if (entry == None) {
-      // Xaction closed due to time out
+  def initiateDBSynch(reps: Set[ActorRef]) = {
+    /**
+      * Generate a unique ID for the DB synch
+      */
+    var _repId = 1000000
+    def getNextId = {val id = _repId; _repId += 1; id}
+
+    for ((key, value) <- kv)
+      startInsertReplication(Insert(key, value, getNextId), reps)
+  }
+
+  def startRemoveReplication(remMsg: Remove) =
+    prepareForReplication(Replicate(remMsg.key, None, remMsg.id),
+      replicators)
+
+
+  def procGet(g: Get) =
+    sender ! GetResult(g.key, kv.get(g.key), g.id)
+
+  def startPersistenceXaction(s: Snapshot): Unit = {
+    pendingPersistenceAck += s.seq -> sender
+    startPersistenceTimers(s.seq, Persist(s.key, s.valueOption, s.seq))
+  }
+
+  def procReplicationAckFromSenders(id: Long, client: ActorRef,
+    pendSet: Set[ActorRef], rcvSet: Set[ActorRef]) {
+    val newPendSet: Set[ActorRef] = pendSet &~ rcvSet
+    log.debug("ReplAck: id {}, pend {}, rcv {}, newSet {}",
+      id, pendSet, rcvSet, newPendSet)
+    /**
+      * If no acknowledgment is pending then operation succeeded!
+      * Remove the pendingAck entry and return success.
+      * Otherwise update the MAP accordingly
+      */
+    if (newPendSet.isEmpty) {
+      log.debug("OperationAck: id {} -> client {}", id, client)
+      cancelReplicationTimers(id).cancel()
+
+      pendingReplicationAcks -= id
+      cancelReplicationTimers -= id
+
+      client ! OperationAck(id)
     } else {
-      // persist or replication succeeded: update pendingAcks accordingly
-      val ackEntry: AckEntry = entry.get
-      val client: ActorRef = ackEntry._1
-      val ackPending: Set[ActorRef] = ackEntry._2 - sender
-      /**
-        * If no acknowledgment is pending then operation succeeded!
-        * Remove the pendingAck entry and return success.
-        * Otherwise update the MAP accordingly
-        */
-      if (ackPending.isEmpty) {
-        pendingAcks -= idOrSeq
-        if (operXaction) client ! OperationAck(idOrSeq)
-        else {
-          client ! SnapshotAck(key, idOrSeq)
-          incrNextSeqExpected
-        }
-      } else {
-        pendingAcks += idOrSeq -> (client, ackPending)
-      }
-    }
-  }
-  def procOperAck(id: XactId) = procAck("junk", id, true)
-  def procSnapAck(key: String, seq: XactId) = procAck(key, seq, false)
-
-  def procTimeOut(idOrSeq: XactId, msg: TimeOut, operXaction: Boolean) {
-    val entry = pendingAcks.get(idOrSeq)
-    if (entry == None) {
-      // xaction was closed successfully or failed definitively
-    } else {
-      msg match {
-        case XactTimeOut(idOrSeq, client) => {
-          if (operXaction) client ! OperationFailed(idOrSeq)
-          pendingAcks -= idOrSeq // stop processing this Xaction
-        }
-        case PersistRetryTimeOut(idOrSeq, persistMsg) => {
-          val sendTo = self
-          context.system.scheduler.scheduleOnce(retryTimeOut) {
-            sendTo ! PersistRetryTimeOut(idOrSeq, persistMsg)
-          } (context.system.dispatcher)
-          persistor ! persistMsg
-        }
-      }
+      pendingReplicationAcks += id -> (client, newPendSet)
     }
   }
 
-  def procOperTimeOut(id: XactId, msg: TimeOut) = procTimeOut(id, msg, true)
-  def procSnapTimeOut(seq: XactId, msg: TimeOut) = procTimeOut(seq, msg, false)
+  def procReplicationAck(r: Replicated) = {
+    val entry = pendingReplicationAcks.get(r.id)
+    if (entry == None) {
+      assert(!cancelReplicationTimers.isDefinedAt(r.id),
+        s"Id ${r.id}: cancel replication timer and pending ack map inconsistent")
+    } else {
+      // replication succeeded: update pendingAcks accordingly
+      val (client, reps) = entry.get
+      procReplicationAckFromSenders(r.id, client, reps, Set(sender))
+    }
+  }
+
+  def procPersistenceAck(p: Persisted) = {
+    val seq = p.id
+    val entry = pendingPersistenceAck.get(seq)
+    if (entry != None) {
+      // persistence succeeded
+      // cancel timers
+      cancelPersistTimers(seq).cancel()
+      cancelPersistRetryTimers(seq).cancel()
+
+      // remove entry
+      val client: ActorRef = entry.get
+      pendingPersistenceAck -= seq
+      cancelPersistTimers -= seq
+      cancelPersistRetryTimers -= seq
+
+      // send Snapshot ACK
+      client ! SnapshotAck(p.key, seq)
+      incrNextSeqExpected
+    } else {
+      assert(!cancelPersistTimers.isDefinedAt(seq),
+        s"Seq $seq: cancel persist timer and pending Persist Ack map insconsistent") 
+      assert(!cancelPersistRetryTimers.isDefinedAt(seq),
+        s"Seq $seq: cancel persist retry timer and pending Persist Ack map insconsistent") 
+    }
+  }
+
+  def procReplicationTimeOut(rTO: ReplicationTimeOut) = {
+    if (pendingReplicationAcks.isDefinedAt(rTO.id)) {
+      log.debug("OperationFailing: msg {}", rTO)
+      cancelReplicationTimers(rTO.id).cancel()
+
+      rTO.client ! OperationFailed(rTO.id)
+
+      pendingReplicationAcks -= rTO.id
+      cancelReplicationTimers -= rTO.id
+    } else {
+      assert(!cancelReplicationTimers.isDefinedAt(rTO.id),
+        s"Id ${rTO.id}: cancel replication timer and pending ack map inconsistent")
+    }
+  }
+
+  def procPersistTimeOut(pTO: PersistTimeOut) = {
+    if (pendingPersistenceAck.isDefinedAt(pTO.seq)) {
+      //cancel timers
+      cancelPersistTimers(pTO.seq).cancel()
+      cancelPersistRetryTimers(pTO.seq).cancel()
+      // remove entry
+      pendingPersistenceAck -= pTO.seq
+      cancelPersistTimers -= pTO.seq
+      cancelPersistRetryTimers -= pTO.seq
+    } else {
+      assert(!cancelPersistTimers.isDefinedAt(pTO.seq),
+        s"Seq ${pTO.seq}: cancel per timer & pend Per Ack map insconsistent") 
+      assert(!cancelPersistRetryTimers.isDefinedAt(pTO.seq),
+        s"Seq ${pTO.seq}: cancel retry pers timer & pend Pers Ack map insconsistent") 
+    }
+  }
+
+  def procPersistRetryTimeOut(pRTO: PersistRetryTimeOut) = {
+    if (pendingPersistenceAck.isDefinedAt(pRTO.seq)) {
+      val sendTo = self
+      cancelPersistRetryTimers(pRTO.seq).cancel()
+      cancelPersistRetryTimers -= pRTO.seq
+      cancelPersistRetryTimers += 
+      pRTO.seq -> context.system.scheduler.scheduleOnce(retryTimeOut) {
+        sendTo ! PersistRetryTimeOut(pRTO.seq, pRTO.persistMsg)
+      } (context.system.dispatcher)
+      persistor ! pRTO.persistMsg
+    } else {
+      assert(!cancelPersistRetryTimers.isDefinedAt(pRTO.seq),
+        s"Seq ${pRTO.seq}: cancel persist retry timer and pending Persist Ack map insconsistent") 
+    }
+  }
+
+  def procSnapshot(s: Snapshot) = {
+    val nextSeqExp = getNextSeqExpected
+    log.debug("Snapshot({}, {}, {}) requested: nextSeqExpected {}",
+      s.key, s.valueOption, s.seq, nextSeqExp)
+    /**
+      * Send a SnapshotAck after persisting the information.
+      * If persisting fails do not send any ack.
+      * Respect the sequence number logic as demanded by the Protocol
+      */
+    if (s.seq == nextSeqExp) {
+      startPersistenceXaction(s)
+      if (s.valueOption != None) kv += s.key -> s.valueOption.get
+      else kv -= s.key
+    } else if (s.seq > nextSeqExp) {
+      // ignored quietly
+    } else {
+      // seq < nextSeqExp => immediately acknowledged and ignored
+      sender ! SnapshotAck(s.key, s.seq)
+    }
+  }
+
+  def procReplicas(r: Replicas) = {
+    /**
+      * Identify
+      * A. Replicas that were alive and are still alive.
+      * B. Old replicas that are now dead.
+      * C. New replicas that have come alive.
+      */
+    val prevR = secondaries.keySet
+    val curR = r.replicas
+    val sameReplicas = curR & prevR
+    val newReplicas = curR &~ prevR
+    val deadReplicas = prevR &~ curR 
+
+    log.debug("Msg Replicas {}: Same {}: New {}: Dead {}",
+      r, sameReplicas, newReplicas, deadReplicas)
+
+    /**
+      * Case A: No need to do anything for these replicas
+      * Handle Case B and Case C
+      */
+    procDeadReplicas(deadReplicas)
+    procNewReplicas(newReplicas)
+  }
+
+  /**
+    * Case B:
+    * 1. Stop Replicator.
+    * 2. Clean any pending acknowledgments to corresponding replicators
+    */
+  def procDeadReplicas(deadReplicas: Set[ActorRef]) = {
+    var deadRepls: scala.collection.mutable.ArrayBuffer[ActorRef] =
+      scala.collection.mutable.ArrayBuffer.empty
+
+    for (ref <- deadReplicas) {
+      assert(secondaries.isDefinedAt(ref),
+        s"Replica $ref dead but replicator entry does not exist")
+      val deadRepl = secondaries(ref)
+      deadRepls += deadRepl
+      context.stop(deadRepl)
+    }
+
+    val deadReplicators = deadRepls.toSet
+    for ((id, (client, reps)) <- pendingReplicationAcks;
+      if (!(reps & deadReplicators).isEmpty))
+      procReplicationAckFromSenders(id, client, reps, deadReplicators)
+  }
+
+  /**
+    * Case C:
+    * For each replica
+    * 1. Start a replicator and record the map from replica to replicator
+    * 2. Tie the lifetime of the replicator with that of the replica
+    * 3. Initiate a full DB replication to the replicator
+    */
+  def procNewReplicas(newReplicas: Set[ActorRef]) = {
+    var newReplicators: scala.collection.mutable.ArrayBuffer[ActorRef] =
+      scala.collection.mutable.ArrayBuffer.empty
+
+    for (replica <- newReplicas) {
+      assert(!replicators.contains(replica),
+        "Replica $replica not a new replica: already in replicator")
+      assert(!secondaries.isDefinedAt(replica),
+        "Replica $replica not a new replica: already in secondaries")
+      val repNum = getNextReplicaNum
+      val replicator = context.actorOf(Replicator.props(replica),
+        s"Replicator-$repNum")
+      newReplicators += replicator
+      replicators += replicator
+      secondaries += replica -> replicator
+      context.watch(replica)
+    }
+
+    initiateDBSynch(newReplicators.toSet)
+  }
 
   /**
     * Behavior for  the leader role.
     */
   val leader: Receive = {
-    /**
-      * Insert/Remove
-      * 1. Persist locally and remotely
-      *    Persist is retried before the 1 second response timeout
-      *    in case persistence failed. The id used in retried
-      *    Persist messages must match the one which was used
-      *    in the first request for this particular update.
-      * 4. If ack is received by 1 sec from all parties return OperationAck
-      *    else OperationFailed
-      */
-    case Insert(key, value, id) => {
-      startOperXaction(Insert(key, value, id))
-      kv += key -> value
-    }
-    case Remove(key, id)        => {
-      startOperXaction(Remove(key, id))
-      kv -= key
-    }
-    case Get(key, id)           => {
-      sender ! GetResult(key, kv.get(key), id)
-    }
-    case XactTimeOut(id, cl) =>
-      procOperTimeOut(id, XactTimeOut(id, cl))
-    case PersistRetryTimeOut(id, persistMsg) =>
-      procOperTimeOut(id, PersistRetryTimeOut(id, persistMsg))
-    case Persisted(key, id) => procOperAck(id)
-    case Replicated(key, id) => procOperAck(id)
-    case Replicas(replicas)     => {
-      /**
-        * For each replica start a replicator
-        * Tie the lifetime of the replicator with that of the replica
-        * Note: replicas also contains the leader: skip the self entry
-        */
-      var i = 0
-      replicas.tail foreach {
-        replica => {
-          i += 1
-          val replicator = context.actorOf(Replicator.props(replica),
-            s"Replicator-$i")
-          replicators += replicator
-          secondaries += replica -> replicator
-          /**
-            * context.watch(replicator)
-            * No need to watch replicator as it will be restarted
-            * automatically by the restart logic were it to tie
-            */
-        }
-      }
-    }
-    case Terminated(ref) => {
-      // TODO
-    }
-    case x => assert(false, "msg $x unexpected in leader")
+    case insMsg: Insert => startInsertReplication(insMsg, replicators)
+    case remMsg: Remove => startRemoveReplication(remMsg)
+    case g: Get => procGet(g)
+    case s: Snapshot => procSnapshot(s)
+    case rTO: ReplicationTimeOut => procReplicationTimeOut(rTO)
+    case pTO: PersistTimeOut => procPersistTimeOut(pTO)
+    case pRTO: PersistRetryTimeOut => procPersistRetryTimeOut(pRTO)
+    case p: Persisted => procPersistenceAck(p)
+    case r: Replicated => procReplicationAck(r)
+    case r: Replicas => procReplicas(r)
+    case Terminated(ref) => // TODO
+    case x => assert(false, s"msg $x unexpected in leader")
   }
   /**
     * TODO Behavior for the replica role.
     */
   val replica: Receive = {
-    case Get(key, id)           => {
-      sender ! GetResult(key, kv.get(key), id)
-    }
-    case Snapshot(key, valueOption, seq) => {
-      log.info("Snapshot({}, {}, {}) requested: nextSeqExpected {}",
-        key, valueOption, seq, getNextSeqExpected)
-      /**
-        * Send a SnapshotAck after persisting the information.
-        * If persisting fails do not send any ack.
-        * Respect the sequence number logic as demanded by the Protocol
-        */
-      if (seq == getNextSeqExpected) {
-        startSnapXaction(Snapshot(key, valueOption, seq))
-        if (valueOption != None) kv += key -> valueOption.get
-        else kv -= key
-      } else if (seq > getNextSeqExpected) {
-        // ignored quietly
-      } else {
-        // seq < getNextSeqExpected => immediately acknoweledged and ignored
-        sender ! SnapshotAck(key, seq)
-      }
-    }
-    case XactTimeOut(seq, cl) => {
-      log.info("XactTimeOut({}, {})", seq, cl)
-      procSnapTimeOut(seq, XactTimeOut(seq, cl))
-    }
-    case PersistRetryTimeOut(seq, persistMsg) => {
-      log.info("PersistRetryTimeOut({}, {})", seq, persistMsg)
-      procSnapTimeOut(seq, PersistRetryTimeOut(seq, persistMsg))
-    }
-    case Persisted(key, seq) => {
-      log.info("Persisted({}, {}): sender {}, persistor {}",
-        key, seq, sender, persistor)
-      procSnapAck(key, seq)
-    }
-    case x => {
-      assert(false, "msg $x unexpected in replica")
-    }  
+    case g: Get => procGet(g)
+    case s: Snapshot => procSnapshot(s)
+    case pTO: PersistTimeOut => procPersistTimeOut(pTO)
+    case pRTO: PersistRetryTimeOut => procPersistRetryTimeOut(pRTO)
+    case p: Persisted => procPersistenceAck(p)
+    case Terminated(ref) => // TODO
+    case x => assert(false, "msg $x unexpected in leader")
   }
 
 }
